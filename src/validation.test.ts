@@ -77,3 +77,26 @@ describe('wire points', () => {
     for (const id of ['startbtn', 'hydfront', 'hydrear', 'brakepedal', 'brakelever']) expect(MOMENTARY.has(id)).toBe(true)
     expect(MOMENTARY.has('killswitch')).toBe(false) })
 })
+describe('polarity and flasher', () => {
+  const base = () => [mk('b', 'battery'), mk('g', 'ground')]
+  it('ECU wired correctly works, reversed does not and is reported', () => {
+    const ok = simulate([...base(), mk('e', 'ecu')], [w('b', 'p1', 'g', 'p0'), w('b', 'p0', 'e', 'p0'), w('b', 'p1', 'e', 'p1')])
+    expect(ok.comp.get('e')!.i).toBeGreaterThan(0.1)
+    const bad = simulate([...base(), mk('e', 'ecu')], [w('b', 'p1', 'g', 'p0'), w('b', 'p0', 'e', 'p1'), w('b', 'p1', 'e', 'p0')])
+    expect(bad.comp.get('e')!.i).toBeLessThan(0.001); expect(bad.issues.some(i => i.title === 'Обратная полярность' && i.level === 'error')).toBe(true) })
+  it('polarity follows the pin types the user set', () => {
+    const n = [...base(), mk('e', 'ecu')]; const d = n[2].data as CompData; d.pins[0].fn = 'gnd'; d.pins[1].fn = 'pwr' // поменяли плюс/минус местами
+    const r = simulate(n, [w('b', 'p1', 'g', 'p0'), w('b', 'p0', 'e', 'p1'), w('b', 'p1', 'e', 'p0')]); expect(r.comp.get('e')!.i).toBeGreaterThan(0.1) })
+  it('reversed starter motor is flagged', () => {
+    const r = simulate([...base(), mk('s', 'starter')], [w('b', 'p1', 'g', 'p0'), w('b', 'p0', 's', 'p1'), w('b', 'p1', 's', 'p0')])
+    expect(r.issues.some(i => i.title === 'Обратная полярность')).toBe(true) })
+  it('lamp with + but no ground is reported', () => {
+    const r = simulate([...base(), mk('l', 'lamplow')], [w('b', 'p1', 'g', 'p0'), w('b', 'p0', 'l', 'p0')]); expect(r.comp.get('l')!.state).toBe('нет массы') })
+  const fl = (lib: string, withGnd = true) => { const n = [...base(), mk('f', lib), mk('l', 'turnfl')]
+    const e = [w('b', 'p1', 'g', 'p0'), w('b', 'p0', 'f', 'p0'), w('f', 'p1', 'l', 'p0'), w('l', 'p1', 'g', 'p0')]; if (lib === 'flasher' && withGnd) e.push(w('f', 'p2', 'g', 'p0')); return { n, e } }
+  it('3-pin flasher blinks the turn lamp', () => { const { n, e } = fl('flasher')
+    expect(simulate(n, e, { t: 0.1 }).comp.get('l')!.lit).toBeGreaterThan(0.9); expect(simulate(n, e, { t: 0.45 }).comp.get('l')!.lit).toBeLessThan(0.01); expect(simulate(n, e, { t: 0.8 }).comp.get('l')!.lit).toBeGreaterThan(0.9) })
+  it('2-pin flasher blinks; 3-pin without ground does not work', () => {
+    const a = fl('flasher2'); expect(simulate(a.n, a.e, { t: 0.1 }).comp.get('l')!.lit).toBeGreaterThan(0.9); expect(simulate(a.n, a.e, { t: 0.45 }).comp.get('l')!.lit).toBeLessThan(0.01)
+    const b = fl('flasher', false); expect(simulate(b.n, b.e, { t: 0.1 }).comp.get('l')!.lit).toBeLessThan(0.01) })
+})

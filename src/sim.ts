@@ -7,7 +7,12 @@ export interface CompRes { v: number; i: number; p: number; lit: number; state?:
 export interface SimResult { pinV: Map<string, number>; comp: Map<string, CompRes>; blown: Set<string>; closed: Set<string>; issues: Issue[]; hasPower: boolean }
 type R = { id: string; node: string; a: string; b: string; r: number; fuse?: number }
 type V = { node: string; a: string; b: string; v: number }
-type St = { blown: Set<string>; closed: Set<string>; diodes: Set<string> }
+type St = { blown: Set<string>; closed: Set<string>; diodes: Set<string>; polOff: Set<string>; flash: Set<string> }
+type Pol = { id: string; node: string; plus: string; minus: string }
+export interface SimOpts { t?: number }
+// Электронные потребители, работающие только при правильной полярности (плюс/минус берутся из типа контактов pwr/gnd)
+export const POLAR = new Set(['ecu', 'cluster', 'speedo', 'tacho', 'display', 'controller', 'immo', 'gps', 'cdi', 'absEcu', 'absMod', 'usb', 'ledstrip'])
+export const FLASH_HALF = 0.35 // с; полупериод мигания ≈ 85 вспышек/мин
 
 // Нагрузки: [контакт A, контакт B, сопротивление, Ом] (≈ при 12 В)
 export const LOADS: Record<string, [string, string, number][]> = {
@@ -40,12 +45,18 @@ export const SELECTORS: Record<string, Record<string, { label: string; pins: str
 const k = (n: Node, p: string) => `${n.id}:${p}`
 
 function build(nodes: Node[], st: St) {
-  const rs: R[] = []; const vs: V[] = []
+  const rs: R[] = []; const vs: V[] = []; const pol: Pol[] = []
   for (const n of nodes) {
     const d = n.data as CompData; const id = d.libId
     const add = (a: string, b: string, r: number, rid = n.id, fuse?: number) => rs.push({ id: rid, node: n.id, a: k(n, a), b: k(n, b), r, fuse })
     if (id === 'battery') { vs.push({ node: n.id, a: k(n, 'int'), b: k(n, 'p1'), v: Number(d.value ?? 12) }); rs.push({ id: n.id + '#int', node: n.id, a: k(n, 'p0'), b: k(n, 'int'), r: 0.02 }) }
-    for (const [a, b, r] of LOADS[id] ?? []) add(a, b, r, n.id + a + b)
+    for (const [a, b, r] of LOADS[id] ?? []) {
+      const pa = d.pins.find(p => p.id === a), pb = d.pins.find(p => p.id === b), eid = n.id + a + b
+      const plus = pa?.fn === 'pwr' && pb?.fn === 'gnd' ? a : pa?.fn === 'gnd' && pb?.fn === 'pwr' ? b : null
+      if (POLAR.has(id) && plus) { const minus = plus === a ? b : a; pol.push({ id: eid, node: n.id, plus: k(n, plus), minus: k(n, minus) }); if (!st.polOff.has(eid)) add(plus, minus, r, eid) }
+      else add(a, b, r, eid)
+    }
+    if (id === 'flasher' || id === 'flasher2') { if (id === 'flasher') add('p0', 'p2', 600, n.id + '#el'); if (st.flash.has(n.id)) add('p0', 'p1', 0.05, n.id + '#c') }
     if (id === 'resistor') add('p0', 'p1', Math.max(Number(d.value ?? 100), 0.001))
     if (id === 'fuse' && !st.blown.has(n.id)) add('p0', 'p1', 0.005, n.id, Number(d.value ?? 15))
     if (id === 'fusebox') for (const i of [1, 2, 3]) if (!st.blown.has(`${n.id}:${i}`)) add('p0', 'p' + i, 0.005, `${n.id}:${i}`, Number(d.value ?? 15))
@@ -54,7 +65,7 @@ function build(nodes: Node[], st: St) {
     const sel = SELECTORS[id]; if (sel) { const pos = sel[String(d.position)] ?? Object.values(sel)[0]; for (const p of pos.pins) add('p0', p, 0.01, n.id + p) }
     if (id === 'diode' && st.diodes.has(n.id)) add('p0', 'p1', 0.05)
   }
-  return { rs, vs }
+  return { rs, vs, pol }
 }
 
 function solveLinear(A: number[][], b: number[]): number[] {
@@ -79,7 +90,7 @@ function run(nodes: Node[], edges: Edge[], st: St) {
     if (PASS.has(d.libId)) for (const p of d.pins.slice(1)) union(k(n, d.pins[0].id), k(n, p.id))
     if (d.libId === 'ground') union('REF', k(n, 'p0')) }
   const bat = nodes.find(n => (n.data as CompData).libId === 'battery'); if (bat) union('REF', k(bat, 'p1'))
-  const { rs, vs } = build(nodes, st)
+  const { rs, vs, pol } = build(nodes, st)
   const ref = find('REF'); const idx = new Map<string, number>()
   const ix = (key: string) => { const r = find(key); if (r === ref) return -1; if (!idx.has(r)) idx.set(r, idx.size); return idx.get(r)! }
   const rI = rs.map(e => [ix(e.a), ix(e.b)]); const vI = vs.map(e => [ix(e.a), ix(e.b)])
@@ -91,11 +102,12 @@ function run(nodes: Node[], edges: Edge[], st: St) {
   const x = N ? solveLinear(A, rhs) : []
   const volt = (key: string) => { const r = find(key); if (r === ref) return 0; const i = idx.get(r); return i === undefined ? 0 : x[i] }
   const cur = rs.map((e, j) => { const [a, b] = rI[j]; return ((a >= 0 ? x[a] : 0) - (b >= 0 ? x[b] : 0)) / e.r })
-  return { rs, vs, volt, cur, batI: vs.map((_, j) => Math.abs(x[n + j])) }
+  return { rs, vs, pol, volt, cur, batI: vs.map((_, j) => Math.abs(x[n + j])) }
 }
 
-export function simulate(nodes: Node[], edges: Edge[]): SimResult {
-  const st: St = { blown: new Set(), closed: new Set(), diodes: new Set() }
+export function simulate(nodes: Node[], edges: Edge[], opts: SimOpts = {}): SimResult {
+  const st: St = { blown: new Set(), closed: new Set(), diodes: new Set(), polOff: new Set(), flash: new Set() }
+  const phaseOn = Math.floor((opts.t ?? 0) / FLASH_HALF) % 2 === 0
   let out = run(nodes, edges, st)
   for (let it = 0; it < 30; it++) {
     let ch = false
@@ -103,8 +115,12 @@ export function simulate(nodes: Node[], edges: Edge[]): SimResult {
     for (const n of nodes) { const d = n.data as CompData
       const rl = RELAYS[d.libId]; if (rl) { const ci = Math.abs(out.volt(k(n, rl.coil[0])) - out.volt(k(n, rl.coil[1]))) / 80
         const want = ci > (st.closed.has(n.id) ? 0.03 : 0.05); if (want !== st.closed.has(n.id)) { want ? st.closed.add(n.id) : st.closed.delete(n.id); ch = true } }
+      if (d.libId === 'flasher' || d.libId === 'flasher2') { const pw = d.libId === 'flasher' ? out.volt(k(n, 'p0')) - out.volt(k(n, 'p2')) : out.volt(k(n, 'p0'))
+        const want = pw > 6 && phaseOn; if (want !== st.flash.has(n.id)) { want ? st.flash.add(n.id) : st.flash.delete(n.id); ch = true } }
       if (d.libId === 'diode') { const vd = out.volt(k(n, 'p0')) - out.volt(k(n, 'p1')); const want = vd > (st.diodes.has(n.id) ? -0.001 : 0.3)
         if (want !== st.diodes.has(n.id)) { want ? st.diodes.add(n.id) : st.diodes.delete(n.id); ch = true } } }
+    for (const q of out.pol) { const dv = out.volt(q.plus) - out.volt(q.minus), off = st.polOff.has(q.id)
+      if (!off && dv < -0.05) { st.polOff.add(q.id); ch = true } else if (off && dv > 0.3) { st.polOff.delete(q.id); ch = true } }
     if (!ch) break
     out = run(nodes, edges, st)
   }
@@ -119,6 +135,16 @@ export function simulate(nodes: Node[], edges: Edge[]): SimResult {
     if (RELAYS[d.libId]) c.state = st.closed.has(n.id) ? 'контакты замкнуты' : 'контакты разомкнуты'
     const bl = [...st.blown].filter(b => b === n.id || b.startsWith(n.id + ':')); if (bl.length) { c.state = 'перегорел'
       issues.push({ level: 'warning', title: 'Предохранитель перегорел', text: `${d.name}: ток превысил ${d.value ?? 15} А. Найдите причину перегрузки до замены.`, ids: [n.id] }) } }
+  // Диагностика по полярности и подключению: плюс/минус определяются по типу контактов (pwr/gnd)
+  for (const n of nodes) { const d = n.data as CompData, pair = LOADS[d.libId]?.[0]; if (!pair) continue
+    const pa = d.pins.find(p => p.id === pair[0]), pb = d.pins.find(p => p.id === pair[1]); if (!pa || !pb) continue
+    const [pp, pm] = pa.fn === 'pwr' && pb.fn === 'gnd' ? [pa, pb] : pa.fn === 'gnd' && pb.fn === 'pwr' ? [pb, pa] : [null, null]; if (!pp || !pm) continue
+    const vp = pinV.get(k(n, pp.id)) ?? 0, vm = pinV.get(k(n, pm.id)) ?? 0, c = comp.get(n.id)!
+    if ((POLAR.has(d.libId) || MOTORS.has(d.libId)) && vm - vp > 3) { c.state = 'обратная полярность'
+      issues.push({ level: POLAR.has(d.libId) ? 'error' : 'warning', title: 'Обратная полярность', text: POLAR.has(d.libId) ? `${d.name}: «${pp.number}» (плюс) на минусе, «${pm.number}» (минус) на плюсе. Электроника не работает и может выйти из строя.` : `${d.name}: полярность перепутана — мотор вращается в обратную сторону.`, ids: [n.id] }) }
+    else if (vp >= 6 && vm >= 6 && Math.abs(vp - vm) < 0.5) { c.state = 'нет массы'
+      issues.push({ level: 'warning', title: 'Нет массы', text: `${d.name}: на контакте «${pp.number}» есть напряжение, но «${pm.number}» (минус) не соединён с массой.`, ids: [n.id] }) } }
+  for (const n of nodes) { const d = n.data as CompData; if (d.libId === 'flasher' || d.libId === 'flasher2') comp.get(n.id)!.state = st.flash.has(n.id) ? 'контакты замкнуты' : 'контакты разомкнуты' }
   const hasPower = nodes.some(n => (n.data as CompData).libId === 'battery')
   if (!hasPower) issues.push({ level: 'info', title: 'Нет источника питания', text: 'Добавьте аккумулятор, чтобы запустить симуляцию.', ids: [] })
   return { pinV, comp, blown: st.blown, closed: st.closed, issues, hasPower }

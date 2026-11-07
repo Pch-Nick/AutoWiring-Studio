@@ -97,7 +97,10 @@ export default function App() {
   const [toast, setToast] = useState(''); const tt = useRef(0)
   const say = (m: string) => { setToast(m); clearTimeout(tt.current); tt.current = window.setTimeout(() => setToast(''), 4000) }
   const issues = useMemo(() => validate(s.nodes, s.edges), [s.nodes, s.edges])
-  const sim = useMemo(() => (s.simOn ? simulate(s.nodes, s.edges) : null), [s.simOn, s.nodes, s.edges])
+  const hasFl = useMemo(() => s.nodes.some(n => /^flasher/.test((n.data as CompData).libId)), [s.nodes])
+  const [tick, setTick] = useState(0)
+  useEffect(() => { if (!s.simOn || !hasFl) return; const i = setInterval(() => setTick(Date.now()), 100); return () => clearInterval(i) }, [s.simOn, hasFl])
+  const sim = useMemo(() => (s.simOn ? simulate(s.nodes, s.edges, { t: hasFl ? tick / 1000 : 0 }) : null), [s.simOn, s.nodes, s.edges, tick, hasFl])
   const edges = useMemo(() => !sim ? s.edges : s.edges.map(e => { const v = sim.pinV.get(`${e.source}:${e.sourceHandle}`) ?? 0
     return { ...e, animated: v > 1, label: [(e.data as WireData).label, v.toFixed(1) + ' В'].filter(Boolean).join(' · ') } }), [sim, s.edges])
   useEffect(() => { document.documentElement.dataset.theme = s.theme }, [s.theme])
